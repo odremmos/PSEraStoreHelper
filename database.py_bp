@@ -1,0 +1,1574 @@
+import traceback
+import psycopg2
+from configparser import ConfigParser
+import datetime
+from async_soup_and_data import gather_game_data, validate_game
+from datetime import timezone
+import numpy
+import asyncio
+import logging
+
+logger = logging.getLogger("discord" + f".{__name__}")
+
+
+def load_config(filename="database.ini", section="postgresql"):
+    parser = ConfigParser()
+    parser.read(filename)
+
+    config = {}
+    if parser.has_section(section):
+        params = parser.items(section)
+        for param in params:
+            config[param[0]] = param[1]
+    else:
+        raise Exception(
+            "Section {0} not found in the {1} file".format(section, filename)
+        )
+
+    return config
+
+
+def connect(config: dict):
+    """Connect to the PostgreSQL database server"""
+    try:
+        # connecting to the PostgreSQL server
+        with psycopg2.connect(**config) as conn:
+            logger.info("Connected to the PostgreSQL server.")
+            return conn
+    except (psycopg2.DatabaseError, Exception) as error:
+        logger.error(error)
+
+
+def convert_timestamps(config):
+    table = "ratings"
+    sql = f"SELECT * FROM {table}"
+    with psycopg2.connect(**config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                for row in rows:
+                    if "Z" not in row[7]:
+                        ts = f"{row[7].replace(' ','T')}Z"
+                        logger.info(ts)
+                        conv_sql = (
+                            f"UPDATE {table} SET timestamp = '{ts}' WHERE id = {row[0]}"
+                        )
+                        cur.execute(conv_sql)
+                conn.commit()
+
+
+def compare_timestamps(db_timestamp: str, import_timestamp: str):
+    date_format = "%Y-%m-%dT%H:%M:%SZ"
+    date1 = datetime.datetime.strptime(db_timestamp, date_format)
+    date2 = datetime.datetime.strptime(import_timestamp, date_format)
+    time_diff = abs(date2 - date1)
+    logger.debug(time_diff.total_seconds() / 3600)
+    if time_diff.total_seconds() / 3600 >= 20:
+        return True
+    else:
+        return False
+
+
+async def check_for_concepts(config: dict, concepts: str):
+    concept_list = []
+    sql = f"SELECT number FROM (VALUES{concepts}) AS numbers(number)WHERE number NOT IN (SELECT concept FROM concepts)"
+    with psycopg2.connect(**config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                for row in rows:
+                    concept_list.append(row[0])
+    return concept_list
+
+
+class insert:
+    def __init__(self):
+        self.concept_rating_inserts = 0
+        self.concept_inserts = 0
+        self.product_price_inserts = 0
+        self.product_inserts = 0
+        self.bestseller_inserts = 0
+        self.bestseller_entry_inserts = 0
+        self.preorder_inserts = 0
+        self.preorder_entry_inserts = 0
+        self.concepts_processed = []
+        self.products_processed = []
+        self.concepts_processed_by_store = {}
+        self.products_processed_by_store = {}
+        self.product_inserted_into_game_store = 0
+
+    async def print_log(self, return_row: tuple, product: str):
+        logger.info(f"Printing log for {product}")
+        bitwise_value = return_row[0]
+        # inserts new product
+        if bitwise_value & 1024 == 1024:
+            logger.info(f"{product} does not exist. Inserting")
+            logger.info("Insert of new product")
+            self.product_inserts += 1
+        # bit wise 1 = Update
+        if bitwise_value & 1 == 1:
+            logger.info("Update")
+        # 2 assigned price
+        if bitwise_value & 2 == 2:
+            logger.info("Assigned price")
+        # inserted and assigned price
+        if bitwise_value & 4 == 4:
+            logger.info("Inserted and assigned price")
+        # assigns name
+        if bitwise_value & 8 == 8:
+            logger.info("Assigned name")
+        # inserts and assigns name
+        if bitwise_value & 16 == 16:
+            logger.info("Inserts and assign name")
+        # assigns release_date
+        if bitwise_value & 32 == 32:
+            logger.info("Assigned release date")
+        # inserts and assign release date
+        if bitwise_value & 64 == 64:
+            logger.info("Inserts and assign release date")
+        # assigns genre
+        if bitwise_value & 128 == 128:
+            logger.info("Assigned genre")
+        # inserts and assignes genre
+        if bitwise_value & 256 == 256:
+            logger.info("Inserts and assignes genre")
+        # inserts existing product
+        if bitwise_value & 512 == 512:
+            logger.info("Insert of existing product")
+            self.product_inserted_into_game_store += 1
+
+    async def insert_rating(
+        self,
+        cur: psycopg2.extensions.cursor,
+        item_type: str,
+        id: str,
+        game: dict,
+        timestamp: str,
+        dry_run: bool = True,
+        first: bool = True,
+    ):
+        insert_rating = False
+        if item_type == "concepts":
+            entry_type = "concept_id"
+            logger.info("Inserting Concept Rating")
+        else:
+            entry_type = "product_id"
+            logger.info("Inserting Product Rating")
+        if not first:
+            cur.execute(
+                f"SELECT timestamp FROM ratings Where {entry_type} = {id} ORDER BY timestamp DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                r_timestamp = row[0]
+                if compare_timestamps(
+                    db_timestamp=r_timestamp,
+                    import_timestamp=timestamp,
+                ):
+                    insert_rating = True
+        if first or insert_rating:
+            logger.info(f"Inserting Rating for {id}")
+            if not dry_run:
+                self.concept_rating_inserts += 1
+                cur.execute(
+                    "".join(
+                        [
+                            "INSERT INTO ratings(rating,one_stars,two_stars,three_stars,four_stars,five_stars,total,timestamp,",
+                            entry_type,
+                            ") VALUES( %s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        ]
+                    ),
+                    (
+                        (
+                            game["starRating"]["rating"]
+                            if game["starRating"]["rating"] != "?"
+                            else 0
+                        ),
+                        game["starRating"]["ratingDistribution"][4],
+                        game["starRating"]["ratingDistribution"][3],
+                        game["starRating"]["ratingDistribution"][2],
+                        game["starRating"]["ratingDistribution"][1],
+                        game["starRating"]["ratingDistribution"][0],
+                        (
+                            game["starRating"]["ratingCount"]
+                            if game["starRating"]["ratingCount"] != "?"
+                            else 0
+                        ),
+                        timestamp,
+                        id,
+                    ),
+                )
+                cur.execute(
+                    f"UPDATE {item_type} SET last_synced = '{timestamp}' Where id = {id}"
+                )
+
+    async def insert_missing_data(
+        self,
+        cur,
+        entry_type: str,
+        id: str,
+        game: dict,
+        dry_run: bool = True,
+        first: bool = True,
+    ):
+        columns = []
+        set = []
+        if entry_type == "concept":
+            entry_type = "concept_id"
+            logger.info("Checking if concept data is missing")
+            sql = f"SELECT invariant_name FROM concepts WHERE id = {id}"
+            cur.execute(sql)
+            row = cur.fetchone()
+            if row:
+                if not row[0] and game["invariant_name"]:
+                    if "'" in game["invariant_name"]:
+                        name = game["invariant_name"].replace("'", "''")
+                    else:
+                        name = game["invariant_name"]
+                    value = "".join(["'", name, "'"])
+                    assignment = "".join(["invariant_name", " = ", value])
+                    set.append(assignment)
+                if len(set) > 0:
+                    logger.info(f"Columns that were missing values: {len(set)}")
+                    value = "".join(
+                        [
+                            "'",
+                            datetime.datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            ),
+                            "'",
+                        ]
+                    )
+                    assignment = "".join(["last_synced", " = ", value])
+                    set.append(assignment)
+                    statement = ", ".join(set)
+                    sql = f"UPDATE concepts  SET {statement}  WHERE id = {id}"
+                    logger.debug(sql)
+                    if not dry_run:
+                        cur.execute(sql)
+        elif entry_type == "product":
+            entry_type = "product_id"
+            logger.info("Checking if product data is missing")
+            sql = f"SELECT genres,age_rating,age_content,edition_type,edition_ordering,name FROM products  WHERE id = {id}"
+            cur.execute(sql)
+            row = cur.fetchone()
+            if row:
+
+                if not row[0] and game["genres"]:
+                    value = "".join(["'", game["genres"], "'"])
+                    assignment = "".join(["genres", " = ", value])
+                    set.append(assignment)
+                if not row[1] and game["age_rating"]:
+                    value = "".join(["'", game["age_rating"], "'"])
+                    assignment = "".join(["age_rating", " = ", value])
+                    set.append(assignment)
+                if not row[2] and game["age_content"]:
+                    value = "".join(["'", game["age_content"], "'"])
+                    assignment = "".join(["age_content", " = ", value])
+                    set.append(assignment)
+                if not row[3] and game["edition_type"]:
+                    value = "".join(["'", game["edition_type"], "'"])
+                    assignment = "".join(["edition_type", " = ", value])
+                    set.append(assignment)
+                if not row[4] and game["edition_ordering"]:
+                    value = str(game["edition_ordering"])
+                    assignment = "".join(["edition_ordering", " = ", value])
+                    set.append(assignment)
+                if not row[5] and game["name"]:
+                    if "'" in game["name"]:
+                        name = game["name"].replace("'", "''")
+                    else:
+                        name = game["name"]
+                    value = "".join(["'", name, "'"])
+                    assignment = "".join(["name", " = ", value])
+                    set.append(assignment)
+                if len(set) > 0:
+                    logger.info(f"Columns that were missing values: {len(set)}")
+                    value = "".join(
+                        [
+                            "'",
+                            datetime.datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            ),
+                            "'",
+                        ]
+                    )
+                    assignment = "".join(["last_synced", " = ", value])
+                    set.append(assignment)
+                    statement = ", ".join(set)
+                    sql = f"UPDATE products SET {statement}  WHERE id = {id}"
+                    logger.debug(sql)
+                    price_sql = f"select pr.amount from products p join product_price pp on p.id = pp.product_id JOIN prices pr on pp.price_id = pr.id where region is null and p.id = {id};"
+                    cur.execute(price_sql)
+                    cur.fetchone()
+                    if row:
+                        if row[0] == game["price"]:
+                            logger.info("price match")
+                            if not dry_run:
+                                cur.execute(sql)
+
+    async def insert_concept_data(
+        self,
+        sem: asyncio.Semaphore,
+        config: dict,
+        game: dict,
+        region: str,
+        timestamp: str,
+        dry_run: bool,
+        force: bool = False,
+        custom_list: bool = False,
+    ):
+        try:
+            # if sem is not None:
+            #    await sem.acquire()
+            #    logger.info("326")
+            concept_id = None
+            first = None
+            with psycopg2.connect(**config) as conn:
+                with conn.cursor() as cur:
+                    if type(game["concept"]) == str:
+                        game["concept"] = int(game["concept"])
+                    # cur.execute(
+                    #    f"SELECT id FROM concepts Where concept = {game['concept']}"
+                    # )
+                    # row = cur.fetchone()
+                    # if not row:
+                    if True:
+                        logger.info(
+                            f"{game['concept']} does not exist in DB. Inserting."
+                        )
+                        self.concept_inserts += 1
+                        if not dry_run:
+                            # await asyncio.sleep(0.25)
+                            cur.execute(
+                                "INSERT INTO concepts_vw(concept,images,cover,region,import_date,publisher,age_content,age_rating) VALUES( %s,%s,%s,%s,%s,%s,%s,%s)",
+                                (
+                                    game["concept"],
+                                    ",".join(game["screens"]),
+                                    game["cover"],
+                                    game["region"],
+                                    datetime.datetime.now(timezone.utc).strftime(
+                                        "%Y-%m-%dT%H:%M:%SZ"
+                                    ),
+                                    game["pub"],
+                                    game["age_content"],
+                                    game["age_rating"],
+                                ),
+                            )
+                            cur.execute(
+                                f"SELECT id FROM concepts Where concept = {game['concept']}"
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                concept_id = row[0]
+                                # first = True
+                    else:
+                        logger.info(f"{game['concept']} does exist in DB.")
+                        concept_id = row[0]
+
+                    if concept_id:
+                        no_day_match = False
+                        if not first:
+                            cur.execute(
+                                f"SELECT timestamp FROM ratings Where concept_id = {concept_id} ORDER BY timestamp DESC LIMIT 1"
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                r_timestamp = row[0]
+                                if (
+                                    compare_timestamps(
+                                        db_timestamp=r_timestamp,
+                                        import_timestamp=timestamp,
+                                    )
+                                    or force
+                                ):
+                                    logger.info(
+                                        f"{game['concept']} Rating does not exist from within 20 last hours"
+                                    )
+                                    no_day_match = True
+                                else:
+                                    logger.info(
+                                        f"{game['concept']} Rating does exist from within 20 last hours"
+                                    )
+                        if first or no_day_match:
+                            await self.insert_rating(
+                                cur=cur,
+                                item_type="concepts",
+                                id=concept_id,
+                                game=game,
+                                timestamp=timestamp,
+                                dry_run=dry_run,
+                            )
+                        else:
+                            logger.info(f"Rating not inserted")
+                    if not dry_run:
+                        conn.commit()
+                    else:
+                        conn.rollback()
+                # if sem is not None:
+                #    await sem.release()
+                #    logger.info("430")
+                # if False:
+                if not custom_list:
+                    await self.insert_product_data(
+                        sem=sem,
+                        config=config,
+                        game=game,
+                        region=game["region"],
+                        timestamp=timestamp,
+                        dry_run=dry_run,
+                        force=force,
+                    )
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            conn.rollback()
+            logger.error(error)
+            logger.info(game["concept"])
+            logger.info(game["product"])
+            logger.info(traceback.format_exc())
+
+    async def insert_product_data(
+        self,
+        config: dict,
+        game: dict,
+        region: str,
+        timestamp: str,
+        dry_run: bool,
+        force: bool = False,
+    ):
+        conn = None
+        logger.debug("Entering insert_product_data")
+
+        try:
+            with psycopg2.connect(**config) as conn:
+                with conn.cursor() as cur:
+                    if game["top_category"] == "ADD_ON":
+                        dlc = True
+                    else:
+                        dlc = False
+                    # cur.execute(
+                    #    f"SELECT id FROM products Where product = '{game['product']}'"
+                    # )
+                    # row = cur.fetchone()
+                    # if not row:
+                    if True:
+
+                        # cur.execute(
+                        #    "SELECT id from sku where sku = %s",
+                        #    (game["product"][:1],),
+                        # )
+                        # row = cur.fetchone()
+                        # sku_id = row[0]
+                        name = (
+                            game["invariant_name"]
+                            if game["invariant_name"]
+                            else game["name"]
+                        )
+                        if not dry_run:
+                            await asyncio.sleep(0.15)
+                            cur.execute(
+                                "INSERT INTO products_vw(product, concept, category, region, edition_type, edition_ordering,  name, invariant_name, release_date, genres, price) VALUES( %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                                (
+                                    game["product"],
+                                    game["concept"],
+                                    game["top_category"],
+                                    game["region"],
+                                    game["edition_type"],
+                                    game["edition_ordering"],
+                                    name,
+                                    game["invariant_name"],
+                                    game["date"],
+                                    game["genres"],
+                                    game["price"],
+                                ),
+                            )
+                            # row = cur.fetchone()
+                            # print(f"Concept: {row}")
+                            cur.execute(
+                                f"SELECT return_value,id FROM log_operation WHERE timestamp = '{game['date']}' AND item_id = '{game['product']}'"
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                await self.print_log(row, game["product"])
+                                cur.execute(
+                                    f"DELETE FROM log_operation where id = {row[1]}"
+                                )
+                            cur.execute(
+                                f"SELECT id FROM products Where product = '{game['product']}'"
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                product_id = row[0]
+                        else:
+                            row = None
+
+                        """if row:
+                            product_id = row[0]
+                        else:
+                            product_id = None
+                        if not dry_run:
+                            cur.execute(
+                                "INSERT INTO prices(amount,timestamp) VALUES (%s,%s) RETURNING id",
+                                (game["price"], timestamp),
+                            )
+                        row = cur.fetchone()
+                        if row:
+                            if not dry_run:
+                                cur.execute(
+                                    "INSERT INTO product_price(product_id,price_id) VALUES (%s,%s)",
+                                    (product_id, row[0]),
+                                )"""
+                        # 1 = PS4, 2 = PS5
+                        if False:
+                            platforms = {"PS4": 1, "PS5": 2}
+                            for platform in game["platforms"]:
+                                if not dry_run:
+                                    cur.execute(
+                                        "INSERT INTO product_platform(product_id,platform_id) VALUES (%s,%s)",
+                                        (product_id, platforms[platform]),
+                                    )
+
+                    else:
+                        product_id = row[0]
+                        """await self.insert_missing_data(
+                            cur=cur,
+                            entry_type="product",
+                            id=product_id,
+                            game=game,
+                            dry_run=dry_run,
+                        )
+                        k = False
+                        if k:
+
+                            cur.execute(
+                                f"SELECT pr.id,pr.amount,pr.timestamp FROM prices pr JOIN product_price pp ON pp.price_id = pr.id Where pp.product_id = {product_id}   ORDER BY timestamp DESC LIMIT 1"
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                r_timestamp = row[2]
+                                if (
+                                    compare_timestamps(
+                                        db_timestamp=r_timestamp,
+                                        import_timestamp=timestamp,
+                                    )
+                                    or force
+                                ):
+                                    r_amount = row[1]
+                                    if r_amount != game["price"]:
+                                        self.product_price_inserts += 1
+
+                                        if not dry_run:
+                                            cur.execute(
+                                                "INSERT INTO prices(amount,timestamp,product_id) VALUES (%s,%s,%s) RETURNING id",
+                                                (game["price"], timestamp, product_id),
+                                            )
+                                            row = cur.fetchone()
+                                            if row:
+                                                cur.execute(
+                                                    "INSERT INTO product_price(product_id,price_id) VALUES (%s,%s)",
+                                                    (product_id, row[0]),
+                                                )"""
+                    if dlc:
+                        if product_id:
+                            await self.insert_rating(
+                                cur=cur,
+                                item_type="products",
+                                id=product_id,
+                                game=game,
+                                timestamp=timestamp,
+                                dry_run=dry_run,
+                            )
+                            if not dry_run:
+                                cur.execute(
+                                    "INSERT INTO prices(amount,timestamp,product_id) VALUES (%s,%s,%s) RETURNING id",
+                                    (game["price"], timestamp, product_id),
+                                )
+                                # if row:
+                                #    if not dry_run:
+                                #        cur.execute(
+                                #            "INSERT INTO product_price(product_id,price_id) VALUES (%s,%s)",
+                                #            (, row[0]),
+                                #        )
+
+                    if not dry_run:
+                        conn.commit()
+                    else:
+                        conn.rollback()
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            if conn:
+                conn.rollback()
+            logger.error(error)
+            logger.error(game["concept"], game["product"])
+            logger.error(traceback.format_exc())
+
+    async def insert_product_data_re(
+        self,
+        config: dict,
+        game: dict,
+        region: str,
+        timestamp: str,
+        dry_run: bool,
+        force: bool = False,
+    ):
+        conn = None
+        logger.debug("Entering insert_product_data")
+
+        try:
+            with psycopg2.connect(**config) as conn:
+                with conn.cursor() as cur:
+                    bit_wise = 0
+                    if game["top_category"] == "ADD_ON":
+                        dlc = True
+                    else:
+                        dlc = False
+                    store_sql = f"SELECT s.id INTO l_store_id FROM store s WHERE s.key = '{game['region']}';"
+                    cur.execute(store_sql)
+                    row = cur.fetchone()
+                    if row:
+                        store_id = row[0]
+                    cur.execute(
+                        f"SELECT id FROM products Where product = '{game['product']}';"
+                    )
+                    row = cur.fetchone()
+                    if not row:
+
+                        l_operation = "NONE"
+                        # New Product
+                        sql = """INSERT INTO products (product, concept, category, region, edition_type, edition_ordering)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id;"""
+                        cur.execute(
+                            sql,
+                            (
+                                game["product"],
+                                game["concept"],
+                                game["top_category"],
+                                game["region"],
+                                game["edition_type"],
+                                game["edition_ordering"],
+                            ),
+                        )
+                        row = cur.fetchone()
+                        #
+                        #            name,
+                        #            game["invariant_name"],
+                        #            game["date"],
+                        #            game["genres"],
+                        #            game["price"],
+                        if row:
+                            product_id = row[0]
+                            # --inserts new product
+                            return_value += 1024
+                            #    END IF;
+                        create_new_gs = """INSERT INTO game_store (product_id,store_id)
+                        VALUES (%s,%s)
+                        RETURNING id;"""
+                        cur.execute(
+                            create_new_gs,
+                            (product_id, store_id),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            gs_id = row[0]
+                    else:
+                        product_sql = f"SELECT p.id INTO l_product_id FROM products p WHERE p.product = '{game['product']}';"
+                        cur.execute(product_sql)
+                        row = cur.fetchone()
+                        if row:
+                            product_id = row[0]
+                        # IF l_product_id IS NOT NULL THEN
+                        gs_sql = f"SELECT gs.id FROM game_store gs WHERE gs.product_id = {product_id} AND gs.store_id = {store_id};"
+                        cur.execute(gs_sql)
+                        row = cur.fetchone()
+                        if row:
+                            gs_id = row[0]
+                        # IF l_gs_id IS NULL THEN
+                        else:
+                            create_new_gs = """INSERT INTO game_store (product_id,store_id)
+                            VALUES (%s,%s)
+                            RETURNING id;"""
+                            cur.execute(
+                                create_new_gs,
+                                (product_id, store_id),
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                gs_id = row[0]
+                            # inserts existing product
+                            return_value += 512
+
+                    # IF l_operation != 'UPDATE' THEN
+                    # Check and insert price
+                    # IF
+                    if game["price"] and game["price"] not in ["TBA", "Not Available"]:
+                        if (
+                            game["discounted_price"]
+                            and game["discounted_price"] < game["price"]
+                        ):
+                            game["price"] = game["discounted_price"]
+                        get_price_sql = """SELECT pr.id ,pr.amount
+                        FROM prices pr
+                        WHERE pr.amount = %s
+                        LIMIT 1;"""
+                        cur.execute(
+                            get_price_sql,
+                            (game["price"]),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            price_id = row[0]
+                            price_amount = row[1]
+                            # IF l_price_id IS NOT NULL AND l_amount = NEW.price THEN
+                            if price_amount == game["price"]:
+                                price_exists = """INSERT INTO product_price (gs_id,price_id)
+                                VALUES (%s,%s);"""
+                                cur.execute(
+                                    price_exists,
+                                    (gs_id, price_id),
+                                )
+                                # --2 assigned price
+                                return_value += 2
+                        # ELSE
+                        else:
+                            insert_price = """INSERT INTO prices (amount)
+                            VALUES (%s)
+                            RETURNING id;"""
+                            cur.execute(
+                                insert_price,
+                                (game["price"]),
+                            )
+                            insert_pp = """INSERT INTO product_price (gs_id,price_id)
+                            VALUES (%s,%s);"""
+                            cur.execute(
+                                insert_price,
+                                (gs_id, game["price"]),
+                            )
+                            # --4 inserted and assigned price
+                            return_value += 4
+                        """SELECT n.id INTO name_id
+      FROM names n
+      WHERE n.invariant_name = NEW.invariant_name and n.name = NEW.name;
+
+      IF name_id IS NOT NULL THEN
+          INSERT INTO product_or_concept_name (gs_id, name_id)
+          VALUES (l_gs_id, name_id);
+          -- assigns name
+          return_value = return_value + 8;
+      ELSE
+          INSERT INTO names (name,invariant_name)
+          VALUES (NEW.name,NEW.invariant_name)
+          RETURNING id INTO name_id;
+          INSERT INTO product_or_concept_name (gs_id, name_id)
+          VALUES (l_gs_id, name_id);
+          -- inserts and assigns name
+          return_value = return_value + 16;
+      END IF;
+
+      -- Check and insert release_date
+      IF NEW.release_date != 'TBA' THEN
+        SELECT rd.id INTO l_rd_id
+        FROM release_dates rd
+        WHERE date = NEW.release_date;
+
+        IF l_rd_id IS NOT NULL THEN
+          INSERT INTO product_release_date (gs_id, rd_id)
+          VALUES (l_gs_id, l_rd_id);
+          -- assigns release_date
+          return_value = return_value + 32;
+        ELSE
+          INSERT INTO release_dates (date)
+          VALUES (NEW.release_date) returning ID into l_rd_id;
+          INSERT INTO product_release_date (gs_id, rd_id)
+          VALUES (l_gs_id, l_rd_id);
+          -- inserts and assign release date
+          return_value = return_value + 64;
+        END IF;
+      END IF;
+      -- Split genres and insert
+
+      IF NEW.genres IS NOT NULL THEN
+        if ( NEW.genres not like '%,%')THEN
+          --l_genres := NEW.genres
+          SELECT ARRAY[NEW.genres] INTO l_genres;
+        ELSE
+          SELECT string_to_array(NEW.genres, ',')::text INTO l_genres;
+        end if;
+        FOREACH genre IN ARRAY l_genres --AS genre
+          LOOP
+              SELECT INTO genre_id
+              FROM genres
+              WHERE name = genre;
+
+              IF genre_id IS NOT NULL THEN
+                  INSERT INTO product_or_concept_genre (gs_id, genre_id)
+                  VALUES (l_gs_id, genre_id);
+                  -- assigns genre
+                  return_value = return_value + 128;
+              ELSE
+                  INSERT INTO genres (name)
+                  VALUES (genre)
+                  RETURNING id INTO genre_id;
+
+                  INSERT INTO product_or_concept_genre (gs_id, genre_id)
+                  VALUES (l_gs_id, genre_id);
+                  -- inserts and assignes genre
+                  return_value = return_value + 256;
+              END IF;
+          END LOOP;
+      END IF;"""
+                        # 1 = PS4, 2 = PS5
+                        if False:
+                            platforms = {"PS4": 1, "PS5": 2}
+                            for platform in game["platforms"]:
+                                if not dry_run:
+                                    cur.execute(
+                                        "INSERT INTO product_platform(product_id,platform_id) VALUES (%s,%s)",
+                                        (product_id, platforms[platform]),
+                                    )
+
+                        else:
+                            product_id = row[0]
+                            """await self.insert_missing_data(
+                                cur=cur,
+                                entry_type="product",
+                                id=product_id,
+                                game=game,
+                                dry_run=dry_run,
+                            )
+                            k = False
+                            if k:
+
+                                cur.execute(
+                                    f"SELECT pr.id,pr.amount,pr.timestamp FROM prices pr JOIN product_price pp ON pp.price_id = pr.id Where pp.product_id = {product_id}   ORDER BY timestamp DESC LIMIT 1"
+                                )
+                                row = cur.fetchone()
+                                if row:
+                                    r_timestamp = row[2]
+                                    if (
+                                        compare_timestamps(
+                                            db_timestamp=r_timestamp,
+                                            import_timestamp=timestamp,
+                                        )
+                                        or force
+                                    ):
+                                        r_amount = row[1]
+                                        if r_amount != game["price"]:
+                                            self.product_price_inserts += 1
+
+                                            if not dry_run:
+                                                cur.execute(
+                                                    "INSERT INTO prices(amount,timestamp,product_id) VALUES (%s,%s,%s) RETURNING id",
+                                                    (game["price"], timestamp, product_id),
+                                                )
+                                                row = cur.fetchone()
+                                                if row:
+                                                    cur.execute(
+                                                        "INSERT INTO product_price(product_id,price_id) VALUES (%s,%s)",
+                                                        (product_id, row[0]),
+                                                    )"""
+                    if False:
+                        if product_id:
+                            await self.insert_rating(
+                                cur=cur,
+                                item_type="products",
+                                id=product_id,
+                                game=game,
+                                timestamp=timestamp,
+                                dry_run=dry_run,
+                            )
+                            if not dry_run:
+                                cur.execute(
+                                    "INSERT INTO prices(amount,timestamp,product_id) VALUES (%s,%s,%s) RETURNING id",
+                                    (game["price"], timestamp, product_id),
+                                )
+                                # if row:
+                                #    if not dry_run:
+                                #        cur.execute(
+                                #            "INSERT INTO product_price(product_id,price_id) VALUES (%s,%s)",
+                                #            (, row[0]),
+                                #        )
+
+                    if not dry_run:
+                        conn.commit()
+                    else:
+                        conn.rollback()
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            if conn:
+                conn.rollback()
+            logger.error(error)
+            logger.error(game["concept"], game["product"])
+            logger.error(traceback.format_exc())
+
+    async def insert_bestsellers(
+        self,
+        config: dict,
+        games_list: list,
+        timestamp: str,
+        region: str,
+        dry_run: bool,
+    ):
+        try:
+            # if sem:
+            #    await sem.acquire()
+            #    logger.info("627")
+            logger.info("Entering insert_bestsellers")
+            save_data = False
+            hash_id = hash(timestamp)
+            with psycopg2.connect(**config) as conn:
+                with conn.cursor() as cur:
+                    store = region
+                    cur.execute(f"SELECT id FROM store Where key = '{store}'")
+                    row = cur.fetchone()
+                    store_id = row[0]
+
+                    cur.execute(
+                        f"SELECT timestamp FROM bestseller Where store_id = {store_id} ORDER BY timestamp DESC"
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        save_data = True
+                        logger.info(f"Bestseller list does not exist. Inserting")
+                    else:
+                        r_timestamp = row[0]
+                        if compare_timestamps(
+                            db_timestamp=r_timestamp, import_timestamp=timestamp
+                        ):
+                            logger.info(
+                                f"Current Bestseller list does not exist. Inserting"
+                            )
+                            save_data = True
+                        else:
+                            logger.info(f"Current Bestseller list does exist. ")
+                    if save_data:
+                        self.bestseller_inserts += 1
+                        for game in games_list:
+                            self.bestseller_entry_inserts += 1
+                            if not dry_run:
+                                cur.execute(
+                                    "INSERT INTO bestseller(store_id,position,hash_id,timestamp,concept) VALUES( %s,%s,%s,%s,%s) RETURNING id",
+                                    (
+                                        store_id,
+                                        game["rank"],
+                                        hash_id,
+                                        timestamp,
+                                        game["id"],
+                                    ),
+                                )
+                            row = cur.fetchone()
+                            if row:
+                                bestseller_id = row[0]
+                                cur.execute(
+                                    f"SELECT id FROM concepts Where concept = {game['id']}"
+                                )
+                                row = cur.fetchone()
+                                if row:
+                                    concept_id = row[0]
+                                    if not dry_run:
+                                        cur.execute(
+                                            "INSERT INTO concept_bestseller(concept_id,bestseller_id) VALUES (%s,%s)",
+                                            (concept_id, bestseller_id),
+                                        )
+
+                        conn.commit()
+        except (Exception, psycopg2.DatabaseError) as error:
+            logger.error(error)
+            logger.error(region)
+            logger.error(game)
+            logger.error(traceback.format_exc())
+        finally:
+            # if sem:
+            #    sem.release()
+            #    logger.info("695")
+            pass
+
+    async def insert_preorders(
+        self,
+        config: dict,
+        games_list: list,
+        timestamp: str,
+        region: str,
+        dry_run: bool,
+    ):
+        logger.info("Entering insert_preorders")
+        hash_id = hash(timestamp)
+        try:
+            # if sem:
+            #    await sem.acquire()
+            #    logger.info("712")
+            save_data = False
+            with psycopg2.connect(**config) as conn:
+                with conn.cursor() as cur:
+                    store = region.upper()
+                    cur.execute(f"SELECT id FROM store Where key = '{store}'")
+                    row = cur.fetchone()
+                    store_id = row[0]
+
+                    cur.execute(
+                        f"SELECT timestamp FROM preorders Where store_id = {store_id} ORDER BY timestamp DESC"
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        save_data = True
+                        logger.info(f"Preorder list does not exist. Inserting")
+                    else:
+                        r_timestamp = row[0]
+                        if compare_timestamps(
+                            db_timestamp=r_timestamp, import_timestamp=timestamp
+                        ):
+                            logger.info(
+                                f"Current Preorder list does not exist. Inserting"
+                            )
+                            save_data = True
+                        else:
+                            logger.info(f"Preorder list does exist. ")
+                    if save_data:
+                        self.preorder_inserts += 1
+                        for game in games_list:
+                            self.preorder_entry_inserts += 1
+                            if not dry_run:
+                                cur.execute(
+                                    "INSERT INTO preorders(store_id,position,hash_id,timestamp,product) VALUES( %s,%s,%s,%s,%s) RETURNING id",
+                                    (
+                                        store_id,
+                                        game["rank"],
+                                        hash_id,
+                                        timestamp,
+                                        game["id"],
+                                    ),
+                                )
+                            # row = cur.fetchone()
+                            # if row:
+                            #    preorder_id = row[0]
+                            #    cur.execute(
+                            #        f"SELECT id FROM products Where product = '{game['id']}'"
+                            #    )
+                            #    row = cur.fetchone()
+                            #    product_id = row[0]
+                            #    if row:
+                            #        if not dry_run:
+                            #            cur.execute(
+                            #                "INSERT INTO product_preorder(product_id,preorder_id) VALUES (%s,%s)",
+                            #                (product_id, preorder_id),
+                            #            )
+
+                        conn.commit()
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            logger.info("error:", error)
+            logger.info(traceback.format_exc())
+        finally:
+            # if sem:
+            #    await sem.release()
+            #   logger.info("776")
+            pass
+
+    async def prepare_concepts(
+        self,
+        store_dict: dict,
+        import_list: dict,
+        data_store: str,
+        dry_run: bool,
+        primary_stores: list,
+    ):
+        try:
+            logger.info("Entering prepare_concepts")
+            config = load_config()
+            ts = datetime.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            games_to_process = {}
+            games_to_process = {
+                game["id"]: store
+                for store in import_list
+                for game in import_list[store]
+                if game["id"] not in games_to_process
+            }
+            sem = asyncio.Semaphore(3)
+            tasks = []
+            insert_tasks = []
+            results = []
+
+            games_to_finally_process = {
+                id: store
+                for id, store in games_to_process.items()
+                if id not in self.concepts_processed
+            }
+            for id in games_to_finally_process:
+                self.concepts_processed.append(id)
+            self.concepts_processed_by_store[data_store] = len(games_to_finally_process)
+            for id in games_to_finally_process:
+                task = asyncio.create_task(
+                    gather_game_data(
+                        sem=sem,
+                        id=id,
+                        region=store_dict[games_to_process[id]]["sub"],
+                        link_type="/concept/",
+                    )
+                )
+                tasks.append(task)
+            completed_tasks = await asyncio.gather(*tasks)
+            logger.info("Collected Concepts")
+            for future in completed_tasks:
+                results.append(future)
+            logger.info(f"Amount of Concepts: {len(results)}")
+
+            for game in results:
+                if game:
+                    await self.insert_concept_data(
+                        sem=sem,
+                        config=config,
+                        game=game,
+                        region=game["region"],
+                        timestamp=ts,
+                        dry_run=dry_run,
+                    )
+                    await asyncio.sleep(0.25)
+
+            # for game in results:
+            #    if game:
+            #        task = asyncio.create_task(
+            #            self.insert_concept_data(
+            #                sem=sem,
+            #                config=config,
+            #                game=game,
+            #                region=game["region"],
+            #                timestamp=ts,
+            #                dry_run=dry_run,
+            #            )
+            #        )
+            #    insert_tasks.append(task)
+            # completed_tasks = await asyncio.gather(*tasks)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logger.error(error)
+            # logger.error(game)
+            logger.error(traceback.format_exc())
+
+    async def search_for_products(self, config: dict, products: str):
+        not_in_table = []
+        sql = f"SELECT prod FROM (VALUES {products}) AS prods(prod) WHERE prod NOT IN (SELECT product FROM products)"
+        with psycopg2.connect(**config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                if rows:
+                    for row in rows:
+                        not_in_table.append(row[0])
+
+        return not_in_table
+
+    async def prepare_products(
+        self,
+        store_dict: dict,
+        import_list: dict,
+        data_store: str,
+        dry_run: bool,
+        primary_stores: list,
+    ):
+        try:
+            config = load_config()
+            ts = datetime.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            games_to_process = {}
+            games_to_process = {
+                game["id"]: store
+                for store in import_list
+                for game in import_list[store]
+                if game["id"] not in games_to_process
+            }
+            # products_to_check = [
+            #    f"('{product}')" for store in import_list for game in import_list[store]
+            # ]
+            products_to_check = [f"('{product}')" for product in games_to_process]
+            products_to_check = ",".join(products_to_check)
+            # products_to_check = [
+            #   game for store in import_list for game in import_list[store]
+            # ]
+            new_products = await self.search_for_products(
+                config=config, products=products_to_check
+            )
+            games_to_process = {
+                key: data
+                for key, data in games_to_process.items()
+                if key in new_products
+            }
+            logger.info(f"Amount of Products: {len(games_to_process)}")
+
+            if len(games_to_process) > 0:
+                sem = asyncio.Semaphore(3)
+                tasks = []
+                results = []
+                concept_tasks = []
+                concept_results = []
+                for game in games_to_process:
+                    task = asyncio.create_task(
+                        gather_game_data(
+                            sem=sem,
+                            id=game,
+                            link_type="/product/",
+                            region=store_dict[games_to_process[game]]["sub"],
+                        )
+                    )
+                    tasks.append(task)
+                completed_tasks = await asyncio.gather(*tasks)
+                for future in completed_tasks:
+                    results.append(future)
+
+                unsorted_concepts = [f"({game['concept']})" for game in results]
+                concepts = numpy.unique(unsorted_concepts)
+                concepts = ",".join(concepts)
+                concepts_to_insert = await check_for_concepts(
+                    config=config, concepts=concepts
+                )
+                concepts_to_insert_dict = {}
+                concepts_to_insert_dict = {
+                    concept: game["region"]
+                    for concept in concepts_to_insert
+                    for game in results
+                    if concept == game["concept"]
+                }
+
+                logger.info(f"Amount of Concepts to insert: {len(concepts_to_insert)}")
+                for concept in concepts_to_insert_dict:
+                    gather_task = asyncio.create_task(
+                        gather_game_data(
+                            sem=sem,
+                            id=str(concept),
+                            region=concepts_to_insert_dict[concept],
+                            link_type="/concept/",
+                        )
+                    )
+                    concept_tasks.append(gather_task)
+                completed_tasks = await asyncio.gather(*concept_tasks)
+                for future in completed_tasks:
+                    concept_results.append(future)
+
+                for game in concept_results:
+                   await self.insert_concept_data(
+                       sem=sem,
+                       config=config,
+                       game=game,
+                       region=game["region"],
+                       timestamp=ts,
+                       dry_run=dry_run,
+                   )
+                   await asyncio.sleep(0.2)
+
+                #insert_c_tasks = []
+                #for game in concept_results:
+                #    insert_c_task = asyncio.create_task(
+                #        self.insert_concept_data(
+                #            sem=sem,
+                #            config=config,
+                #            game=game,
+                #            region=game["region"],
+                #            timestamp=ts,
+                #            dry_run=dry_run,
+                #        )
+                #    )
+                #    insert_c_tasks.append(insert_c_task)
+                #completed_tasks = await asyncio.gather(*insert_c_tasks)
+                for game in results:
+                    await self.insert_product_data(
+                        config=config,
+                        game=game,
+                        region=game["region"],
+                        timestamp=ts,
+                        dry_run=dry_run,
+                    )
+                    # await asyncio.sleep(0.2)
+                # insert_tasks = []
+                # for game in results:
+                #    task = asyncio.create_task(
+                #        self.insert_product_data(
+                #            sem=sem,
+                #            config=config,
+                #            game=game,
+                #            region=game["region"],
+                #            timestamp=ts,
+                #            dry_run=dry_run,
+                #        )
+                #    )
+                #    insert_tasks.append(task)
+                # completed_tasks = await asyncio.gather(*insert_tasks)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logger.error(error)
+            logger.error(game)
+            logger.error(traceback.format_exc())
+
+
+async def check_for_orig_country(config: dict, id: str):
+    sql = f"SELECT s.COMPONENT FROM store s JOIN concepts co ON s.key = co.import_region WHERE co.concept = {id};"
+    with psycopg2.connect(**config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            row = cur.fetchone()
+            if row:
+                region = row[0]
+                return region
+            else:
+                return
+
+
+async def sync_out_of_date(dry_run: bool, force: bool):
+    config = load_config()
+    sql = """select co.concept from concepts co
+            JOIN (SELECT concept_id, MAX(timestamp) AS newest_timestamp
+            FROM ratings    GROUP BY concept_id) ra  on co.id = ra.concept_id
+            WHERE EXTRACT(DAY FROM ((NOW()at time zone 'utc') - TO_TIMESTAMP(newest_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))::INTERVAL) >= 1
+            order by newest_timestamp;"""
+    concept_dict = {}
+    insert_tasks = []
+    tasks = []
+    results = []
+    sem = asyncio.Semaphore(3)
+    ts = datetime.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    insert_handler = insert()
+    with psycopg2.connect(**config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                for row in rows:
+                    concept_dict.update({row[0]: ""})
+    for id in concept_dict:
+        region = await check_for_orig_country(config=config, id=id)
+        if region:
+            pass
+        else:
+            region = "en-us"
+        task = asyncio.create_task(
+            gather_game_data(
+                sem=sem,
+                id=str(id),
+                region=region,
+                link_type="/concept/",
+            )
+        )
+        tasks.append(task)
+    completed_tasks = await asyncio.gather(*tasks)
+    for future in completed_tasks:
+        results.append(future)
+
+    logger.info(f"Amount of Concepts: {len(results)}")
+    for game in results:
+        if game:
+            c_task = asyncio.create_task(
+                insert_handler.insert_concept_data(
+                    sem=sem,
+                    config=config,
+                    game=game,
+                    region=game["region"],
+                    timestamp=ts,
+                    dry_run=dry_run,
+                    force=force,
+                )
+            )
+            insert_tasks.append(c_task)
+    completed_tasks = await asyncio.gather(*insert_tasks)
+
+    insert_p_tasks = []
+
+    for game in results:
+        p_task = insert_handler.insert_product_data(
+            sem=sem,
+            config=config,
+            game=game,
+            region=game["region"],
+            timestamp=ts,
+            dry_run=dry_run,
+            force=force,
+        )
+        insert_p_tasks.append(p_task)
+    completed_tasks = await asyncio.gather(*insert_p_tasks)
+    logger.info(f"Inserted Concepts: {insert_handler.concept_inserts}")
+    logger.info(f"Inserted Ratings: {insert_handler.concept_rating_inserts}")
+    logger.info(f"Inserted Products: {insert_handler.product_inserts}")
+    logger.info(f"Inserted Prices: {insert_handler.product_price_inserts}")
+    logger.info("Completed Synching out of date games")
+
+
+async def custom_list_import(dry_run: bool, force: bool = False):
+    custom_games = {
+        205353: "UNCHARTED™ The Nathan Drake Collection",
+        205354: "UNCHARTED 4",
+        221698: "Gravity Rush™ 2",
+        226357: "Gravity Rush",
+        232654: "Hollow Knight",
+        225857: "SHADOW OF THE COLOSSUS",
+        201597: "xv",
+        10002100: "xvi",
+        10008047: "pentiment",
+        10008685: "Hi-Fi RUSH",
+        203974: "shovel",
+        203902: "rayman legends",
+        10002648: "hades",
+        10002344: "FINAL FANTASY VI",
+        205354: "UNCHARTED Lost Legacy",
+        10002342: "FINAL FANTASY IV",
+        229480: "FINAL FANTASY VIII",
+        228618: "God of War III Remastered",
+        234823: "Tales of Arise",
+        229066: "Granblue Fantasy: Relink",
+        10005211: "Ghost Trick: Phantom Detective",
+        10004480: "Like a Dragon: Ishin!",
+        231819: "Control",
+        10005262: "Sherlock Holmes: The Awakened",
+        10000846: "Forspoken",
+        225697: "kingdom hearts",
+        229826: "Outer Wilds",
+        10003386: "Rise of The Ronin",
+        202214: "Jak and Daxter: The Precursor Legacy",
+        217223: "Knack 2",
+        10001815: "ARMORED CORE",
+        203200: "Odin Sphere",
+        232995: "Ni no Kuni: Wrath of the White Witch Remastered",
+        228797: "Ni no Kuni II: Revenant Kingdom",
+        221809: "Ys VIII: Lacrimosa of DANA",
+        10002771: "Persona 5 Royal",
+        233095: "13 Sentinels: Aegis Rim",
+        228903: "A Hat in Time",
+        10000669: "rift apart",
+        234733: "Return of the Obra Dinn",
+        234026: "The House In Fata Morgana",
+        235227: "Ghost of Tsushima",
+        10001235: "Kena: Bridge of Spirits",
+        10000176: "Returnal",
+        10002458: "The Forgotten City",
+        10003533: "Sword and Fairy 7: Together Forever",
+        234427: "Medievil",
+        10000177: "Sackboy",
+        228887: "Undertale",
+        10005446: "Cocoon",
+        10003808: "Deaths door",
+        10004409: "Wild Arms",
+        205041: "The Order: 1886",
+        10002422: "Psychonauts 2",
+        217641: "Root Letter",
+        203706: "Resogun",
+        227151: "Hellblade",
+        201204: "Inquisition",
+        203705: "Rogue Galaxy",
+        10003382: "Persona 4 Golden",
+        10004508: "VALKYRIE PROFILE: LENNETH",
+        10004428: "VALKYRIE ELYSIUM",
+        10004707: "Inscryption",
+        234756: "Trials of Mana",
+        231335: "Monkey King: Hero is back",
+        205307: "Wild Arms™ 3",
+        232977: "Castlevania Requiem: Symphony of the Night & Rondo of Blood",
+        10008568: "Tomb Raider I-III Remastered Starring Lara Croft",
+        232844: "Ketsui Deathtiny -Kizuna Jigoku Tachi",
+        230138: "Valkyria Chronicles Remastered + Valkyria Chronicles 4 Bundle",
+        10001956: "Tactics Ogre: Reborn",
+        228209: "Final Fantasy XII The Zodiac Age",
+        10005249: "Ray'z Arcade Chronology",
+        10009757: "Arcade Archives Rainbow Islands",
+        10000990: "Bubble Bobble 4 Friends",
+        221826: "バトルガレッガ",
+        216026: "Arcade Archives Bubble Bobble",
+        233467: "ESP RA.DE. PSY",
+        "UP0082-PPSA10664_00-0799424989786604": "XVI Expansion Pass",
+        10003612: "Tchia",
+        10007911: "Granblue Versus Rising",
+        10004698: "dd",
+        10007905: "en",
+        "JP9000-PPSA09382_00-UCJS101170000000": "Oreshika",
+        "JP9000-PPSA06790_00-UCJS100900000000": "Resistance Retribution",
+    }
+    # custom_games = {232977: "Tchia", 10004508: "hh", 202214: "jk"}
+    try:
+        game = None
+        logger.info("Begin Custom Import")
+        regions = ["en-us", "ja-jp", "en-gb"]
+        config = load_config()
+        ts = datetime.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        sem = asyncio.Semaphore(3)
+        tasks = []
+        insert_tasks = []
+        results = []
+        specific_products = []
+        insert_handler = insert()
+        for region in regions:
+            if region == "en-gb":
+                if len(custom_games) > 10:
+                    del custom_games[234026]
+                    del custom_games[232844]
+                    del custom_games[230138]
+                    del custom_games[221826]
+            for id in custom_games:
+                _, is_concept = validate_game(game=str(id))
+                if is_concept:
+                    link_type = "/concept/"
+                else:
+                    link_type = "/product/"
+                    specific_products.append(id)
+                task = asyncio.create_task(
+                    gather_game_data(
+                        sem=sem,
+                        id=str(id),
+                        region=region,
+                        link_type=link_type,
+                    )
+                )
+                tasks.append(task)
+            completed_tasks = await asyncio.gather(*tasks)
+        for future in completed_tasks:
+            results.append(future)
+        logger.info(f"Amount of Concepts Regions Added: {len(results)}")
+        concepts_to_process = {}
+        concepts_to_process = {
+            game["concept"]: game
+            for game in results
+            if game
+            if game["concept"] not in concepts_to_process
+            or game["product"] in specific_products
+        }
+
+        for concept, game in concepts_to_process.items():
+            c_task = asyncio.create_task(
+                insert_handler.insert_concept_data(
+                    sem=sem,
+                    config=config,
+                    game=game,
+                    region=game["region"],
+                    timestamp=ts,
+                    dry_run=dry_run,
+                    force=force,
+                    custom_list=True,
+                )
+            )
+            insert_tasks.append(c_task)
+        completed_tasks = await asyncio.gather(*insert_tasks)
+        logger.info(f"Completed Concepts entering Products")
+        products_to_process = {}
+        products_to_process = {
+            game["product"]: game
+            for game in results
+            if game
+            if game["product"] not in products_to_process
+        }
+        insert_p_tasks = []
+
+        for product, game in products_to_process.items():
+            p_task = insert_handler.insert_product_data(
+                sem=sem,
+                config=config,
+                game=game,
+                region=game["region"],
+                timestamp=ts,
+                dry_run=dry_run,
+                force=force,
+            )
+            insert_p_tasks.append(p_task)
+        completed_tasks = await asyncio.gather(*insert_p_tasks)
+
+        logger.info(f"Inserted Concepts: {insert_handler.concept_inserts}")
+        logger.info(f"Inserted Ratings: {insert_handler.concept_rating_inserts}")
+        logger.info(f"Inserted Products: {insert_handler.product_inserts}")
+        logger.info(f"Inserted Prices: {insert_handler.product_price_inserts}")
+        logger.info(f"GS Inserts: {insert_handler.product_inserted_into_game_store }")
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(error)
+        logger.error(game)
+        logger.error(traceback.format_exc())

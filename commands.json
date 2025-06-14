@@ -1,0 +1,81 @@
+{
+  "commands": {
+    "addalias": {
+      "description": "Add your own alias",
+      "text": "Parameters: alias stores You are able to create a custom alias for store collections. Maximum amount of aliases is 5.\nThe alias can be any 4 letter combination and the store list can be any combination of 10 stores."
+    },
+    "esrb": {
+      "description": "Get the ESRB entry of a game",
+      "text": "Parameter: game\n\nReturns an embed with the games ESRB rating."
+    },
+    "famitsu": {
+      "description": "Shows famitsu top 30",
+      "text": "Parameter: The Week you want the Ranking for.\n\nReturns an embed with basic store information as well as a link to it."
+    },
+    "gameinfo": {
+      "description": "Information about a game",
+      "text": "Parameters: game (store)\nThe game you want to receive information for. Either pick via the autocomplete or directly put in the Concept or Product ID.\nFor example:\n[/gameinfo (game 221698)] will get you information on Gravity Rush 2\n[/gameinfo (game UP9000-CUSA03694_00-GRAVITYRUSH20000)] will also get you Gravity Rush 2\n\nTo get autocomplete suggestions from a different country either use (searchin) or use the following way to cast a different store:\n/gameinfo (game kr,<search_term>)\n\nThe default store that the information is pulled from is the US Store.\nYou can use the store parameter to change the store. Use the two letter id for the country."
+    },
+    "howlongtobeat": {
+      "description": "HLTB info for a game",
+      "text": "Parameters: game\n\nReturns an embed with information for a game from How Long To Beat."
+    },
+    "igea": {
+      "description": "Current IGEA Chart",
+      "text": "Returns an embed with the current chart of Australias/New Zealands 10 most selling games."
+    },
+    "la": {
+      "description": "Lists all available aliases",
+      "text": "Returns an embed with the available aliases."
+    },
+    "ls": {
+      "description": "Lists all available stores",
+      "text": "Returns an embed with the available stores and their two letter codes."
+    },
+
+    "preorders": {
+      "description": "Top 12 Pre-Orders",
+      "text": "Parameter: stores\n\nReturns an embed with the 10 bestselling games of the stores provided.\n\nYou can use the store autocomplete, use an alias , or type the store with the countries 2 letter code or a comma seperated 2 letter list.\nExamples: /topten Denmark (DK), /topten stores:eu, /topten stores: fr,jp,kr\n\nif its a single store there will be a picture in the embed of the 10 games.\nAlternatively onlyimages will print just images.\n\nTo get a list of the codes use /liststores"
+    },
+
+    "rating": {
+      "description": "Shows the rating for games",
+      "text": "Parameters: A bunch of games. First one is required\n\nReturns an embed with the rating (Amount, Numerical score, score depcited via moon emotes) of the game or games provided.\n\nEither pick one via autocomplete or use a comma seperated list of ids in the first parameter:\n\n/rating [game 221698,10005844,200520,233202,201930]"
+    },
+
+    "screens": {
+      "description": "Screenshots of a game",
+      "text": "Parameters: game Returns an embed with 4 (or as many as there with 4 as max) screenshots for the game you put in."
+    },
+
+    "searchpreorder": {
+      "description": "Search through pre-order",
+      "text": "Parameters: game stores Returns the positions in the preorder lists for the stores provided.\nNote: This can take some time to compute."
+    },
+
+    "searchtopten": {
+      "description": "Search the Top Ten",
+      "text": "Parameters: game stores excludef2p\n\nReturns the positions in the 10 bestselling lists for the stores provided.\nWhen exclude2p is activated Free to Play games are removed from the count."
+    },
+    "searchtop120": {
+      "description": "Search game in Top 120",
+      "text": "Parameters: game stores excludef2p\n\nReturns the positions in the 120 bestselling lists for the stores provided.\nWhen exclude2p is activated Free to Play games are removed from the count."
+    },
+    "sell": {
+      "description": "Current SELL Chart",
+      "text": "Returns an embed with the current chart of France 5 most selling games."
+    },
+    "storeinfo": {
+      "description": "Basic store information",
+      "text": "Parameters: store\n\nReturns an embed with basic store information as well as a link to it."
+    },
+    "topten": {
+      "description": "Top Ten of a Country",
+      "text": "Parameter: stores\n\nReturns an embed with the 10 bestselling games of the stores provided.\n\nYou can use the store autocomplete, use an alias , or type the store with the countries 2 letter code or a comma seperated 2 letter list.\nExamples: /topten Denmark (DK), /topten stores:eu, /topten stores: fr,jp,kr\n\nif its a single store there will be a picture in the embed of the 10 games.\nAlternatively onlyimages will print just images.\n\nTo get a list of the codes use /liststores"
+    },
+    "trending": {
+      "description": "Trending games of a store",
+      "text": "Parameters: store\n\nReturns an embed with the trending games for the given store."
+    }
+  }
+}
